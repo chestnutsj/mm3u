@@ -4,7 +4,7 @@ use std::io::{Result, Read,Write};
 use std::path::{Path, PathBuf};
 
 pub struct Status {
-    info : String,
+    info :  PathBuf,
     page_size: usize,
     mmap: Option<MmapMut>,
 }
@@ -13,18 +13,16 @@ static STATUS_HEADER:usize = std::mem::size_of::<usize>()*2;
 
 impl Status {
    // 从文件中读取状态信息
-   pub fn new(filename: &str) -> Result<Self> {
+   pub fn new<P: AsRef<Path>>(filename: P) -> Result<Self> {
 
-
-    let meta = std::fs::metadata(filename);
-
+    let meta = std::fs::metadata(filename.as_ref());
     let file_len = match meta {
         Ok(d) => d.len(),
         Err(_) => 0,
     };
  
     let mut status = Status {
-        info : filename.to_string(),
+        info : filename.as_ref().to_path_buf(),
         page_size: 0,
         mmap: None,
     };
@@ -50,11 +48,12 @@ impl Status {
         }
 
         let total_len = STATUS_HEADER+ page_len;
-        let file = OpenOptions::new().read(true).write(true).create(true).open(self.info)?;
+        let file = OpenOptions::new().read(true).write(true).create(true).open(&self.info)?;
         file.set_len(total_len as u64) ?;
         let mut mmap = unsafe { MmapOptions::new().map_mut(&file)? };
         mmap.fill(0);
-        mmap.copy_from_slice(&self.page_size.to_ne_bytes());
+        (&mut mmap[0..]).write_all (&self.page_size.to_ne_bytes())?;
+        //mmap.copy_from_slice(&self.page_size.to_ne_bytes());
         (&mut mmap[std::mem::size_of::<usize>()..]).write_all(&mut page_len.to_ne_bytes())?;
         mmap.flush()?;
         self.mmap = Some( mmap );
@@ -76,16 +75,17 @@ impl Status {
         if let Some(data) = &self.mmap {
             data.iter()
                 .enumerate()
-                .skip(STATUS_HEADER+1) // 从索引为 10 的位置开始迭代
-                .filter(|(_, &value)| value != 0) // 过滤出值不为 0 的元素
-                .map(|(index, _)| index) // 提取索引
-                .collect() // 将结果收集到向量中并返回
+                .skip(STATUS_HEADER)
+                .filter(|(_, &value)| value == 0)  
+                .map(|(index, _)| index- STATUS_HEADER)  
+                .collect()
         } else {
-            Vec::new() // 如果 mmap 为 None，则返回空向量
+            Vec::new()
         }
     }
 
+    pub fn is_init(&self)->bool {
+        self.page_size != 0 
+    }
   
 }
-
-
