@@ -1,0 +1,120 @@
+use std::env;
+use std::fs::File;
+use std::io::{self, Seek, SeekFrom};
+use std::path::Path;
+use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
+use tokio::fs::{self, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use reqwest::header::{HeaderValue, RANGE};
+use futures::future::try_join_all;
+use std::time::Duration;
+
+async fn download_file_with_retry(url: &str, output_file_path: &str, start_byte: u64, max_retry: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let mut retry = 0;
+    loop {
+        match download_file(url, output_file_path, start_byte).await {
+            Ok(_) => break,
+            Err(err) => {
+                if retry >= max_retry {
+                    return Err(err);
+                }
+                println!("Failed to download file: {}. Retrying...", err);
+                retry += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await; // 等待一段时间后重试
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn download_file(url: &str, output_file_path: &str, start_byte: u64) -> Result<(), Box<dyn std::error::Error>> {
+    // 发送 HTTP GET 请求，设置 Range 头以支持断点续传
+    let client = reqwest::Client::new();
+    let response = client.get(url)
+        .header(RANGE, HeaderValue::from_str(&format!("bytes={}-", start_byte))?)
+        .send()
+        .await?;
+    
+    // 创建文件，如果支持断点续传则追加写入，否则覆盖写入
+    let mut file = if response.status().is_partial_content() {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(true) // 追加写入
+            .open(output_file_path)
+            .await?
+    } else {
+        File::create(output_file_path)?
+    };
+
+    // 将响应内容写入文件
+    let mut stream = response.bytes_stream();
+    while let Some(item) = stream.next().await {
+        let chunk = item?;
+        file.write_all(&chunk).await?;
+    }
+
+    Ok(())
+}
+
+async fn download_m3u8(url: &str, output_dir: &str, concurrency: usize, max_retry: usize) -> Result<(), Box<dyn std::error::Error>> {
+    // 发送 HTTP GET 请求，获取 m3u8 文件内容
+    let client = reqwest::Client::new();
+    let response = client.get(url).send().await?;
+    let m3u8_content = response.text().await?;
+    
+    // 解析 m3u8 文件内容，获取所有子文件的 URL
+    let mut urls = vec![];
+    for line in m3u8_content.lines() {
+        if !line.starts_with("#") {
+            urls.push(line.to_owned());
+        }
+    }
+    
+    // 创建输出目录
+    if !Path::new(output_dir).exists() {
+        fs::create_dir_all(output_dir).await?;
+    }
+
+    // 下载所有子文件
+    let semaphore = Semaphore::new(concurrency);
+    let tasks = urls.into_iter().map(|url| {
+        let semaphore = semaphore.clone();
+        let output_file_path = format!("{}/{}", output_dir, url.split('/').last().unwrap());
+        async move {
+            let _permit = semaphore.acquire().await.unwrap();
+            download_file_with_retry(&url, &output_file_path, 0, max_retry).await?;
+            Ok(())
+        }
+    });
+
+    // 同时下载多个子文件
+    let _ = try_join_all(tasks).await?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 解析命令行参数
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 5 {
+        eprintln!("Usage: {} <url> <output_dir> <concurrency> <max_retry>", args[0]);
+        return Ok(());
+    }
+    let url = &args[1];
+    let output_dir = &args[2];
+    let concurrency = args[3].parse::<usize>().unwrap_or(1);
+    let max_retry = args[4].parse::<usize>().unwrap_or(3);
+
+    // 如果是 m3u8 文件，则使用指定并发度下载所有子文件，并设置最大重试次数
+    if url.ends_with(".m3u8") {
+        download_m3u8(url, output_dir, concurrency, max_retry).await?;
+    } else {
+        // 否则，单线程下载文件，并设置最大重试次数
+        download_file_with_retry(url, output_dir, 0, max_retry).await?;
+    }
+
+    Ok(())
+}
