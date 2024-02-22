@@ -1,5 +1,5 @@
 use clap::Parser;
-
+use anyhow::Result;
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -21,8 +21,9 @@ struct Args {
     url: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+
+fn main() -> Result<()> {
     let args = Args::parse();
     let name = if let Some(name) = args.name {
         name
@@ -30,7 +31,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.url.split('/').last().unwrap_or_default().to_string()
     };
     println!("name: {}", name);
-
     println!("Output directory: {}", args.directory);
     println!("Concurrency: {}", args.concurrency);
     println!("Retry: {}", args.max_retry);
