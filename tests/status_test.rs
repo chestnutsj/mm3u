@@ -15,20 +15,21 @@ mod tests {
         ss.set_page(1024, 1024*10+1).expect("Failed to set page");
         
         // 更新位图
-        ss.update(2).expect("Failed to update");
-
+        ss.update(2, 3).expect("Failed to update");
 
         // 读取文件内容验证写入是否成功
         let file_content = std::fs::read(filename).unwrap();
-
-        assert_eq!(file_content.len(),  std::mem::size_of::<usize>()*2 + 11); // 检查文件长度是否正确，page_size(4字节) + page_len(4字节) + bitmap(每个bool占1字节)
+        
+        assert_eq!(file_content.len(),  std::mem::size_of::<usize>()*2 + 11*std::mem::size_of::<u32>()); // 检查文件长度是否正确，page_size(4字节) + page_len(4字节) + bitmap(每个bool占1字节)
         }
 
         {
         let mut ss = Status::new(filename).expect("Failed to create Status");
         assert_eq!( ss.is_init(), true);
-        assert_eq!( ss.find_non_zero_indexes(), vec![0,1,2,4,5,6,7,8,9,10]);
-        ss.update(3).expect("update 3 failed");
+        let res = ss.find_crc32();
+        // println!("{:?}",res);
+        assert_eq!(res[2], 3);
+        ss.update(3,3).expect("update 3 failed");
 
         }
 
