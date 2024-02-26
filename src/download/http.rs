@@ -1,6 +1,5 @@
 use std::path::{PathBuf,Path};
 use anyhow::{Error, Ok, Result};
-
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, RANGE};
 use reqwest::{IntoUrl,Url};
 use futures_util::StreamExt;
@@ -9,9 +8,11 @@ use crate::status::Status;
 use tokio::io::{AsyncReadExt, AsyncWriteExt,AsyncSeekExt};
 use tokio::sync::mpsc;
 use std::io::SeekFrom;
-use crc32fast::Hasher;
+use tokio::task;
+use std::sync::{Arc, Mutex};
 
 pub struct Pdata{
+    index: usize,
     offset : u64,
     data: Vec<u8>
 }
@@ -22,10 +23,10 @@ pub struct DownTask {
     output_dir: PathBuf,
     name: String,
     status: Status,
-    target: Option<File>,
 }
 
 static LIMITE_PATE_SIZE:u64 = 1024;
+
 
 impl DownTask {
     pub async fn new<U: IntoUrl, P: AsRef<Path>>(url :U, dir:P,name: &str) -> Result<Self> {
@@ -43,27 +44,12 @@ impl DownTask {
         source: url.into_url()?,
         output_dir: dir.as_ref().to_path_buf(),
         name: name.into(),
-        status: Status::new(status_name)?,
-        target: None,
+        status:  Status::new(status_name)?,
        };
        Ok(task)
     }
 
-    pub async fn init_target_file(&mut self)->Result<()> {
-        let mut file = PathBuf::from(self.output_dir.clone());
-        file.push(self.name.as_str());
-        let  result = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .append(true) // 追加写入
-        .open(file)
-        .await?;
-        self.target = Some(result);
-        Ok(())
-    }
-
-    pub async fn down_chunk(&self, start :u64, end: u64, sender: mpsc::Sender<Pdata>) ->Result<()> {
+    pub async fn down_chunk(&self,idx :usize, start :u64, end: u64, sender: mpsc::Sender<Pdata>) ->Result<()> {
         let req = reqwest::Client::new().get(self.source.as_str());
         let req  = if end == u64::MAX {
             req.header(RANGE, format!("bytes={}-{}", start, ""))
@@ -75,23 +61,36 @@ impl DownTask {
         if !rep.status().is_success() {
             return Err(Error::msg("request fail"));
         }
-        let mut stream = rep.bytes_stream();
-        let mut offset = start;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            let pdata = Pdata {
-                offset,
-                data: chunk.to_vec(),
-            };
-            sender.send(pdata).await?;
-            offset += chunk.len() as u64;
+        let bytes = rep.bytes().await?;
+        
+        let pdata = Pdata {
+            index:idx,
+            offset:start,
+            data: bytes.to_vec(),
+        };
+
+        sender.send(pdata).await?;
+        Ok(())
+    }
+
+    async fn write_to_file(receiver:&mut mpsc::Receiver<Pdata> ,file :&mut File , status: &Arc<Mutex<Status>>) -> Result<()> {
+        let mut status = status.lock();
+
+        while let Some(chunk) = receiver.recv().await {
+            // 写入下载的数据到文件
+            file.seek(SeekFrom::Start(chunk.offset)).await?;
+            file.write_all(&chunk.data).await?;
+            let checksum = crc32fast::hash(&chunk.data);
+            status.update(chunk.index, checksum)?;
         }
         Ok(())
     }
-    pub async fn muti_download(&self)->Result<()> {
+    
+
+    pub async fn muti_download(&mut self, total_len : u64)->Result<()> {
         let mut file = PathBuf::from(self.output_dir.clone());
         file.push(self.name.as_str());
-        let  result = OpenOptions::new()
+        let  mut rr = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
@@ -99,8 +98,20 @@ impl DownTask {
         .open(file)
         .await?;  
 
-        let (sender, receiver) = mpsc::channel::<Pdata>(10);
+        self.status.set_page(LIMITE_PATE_SIZE as usize, total_len)?;
+     
+        let (sender,mut receiver) = mpsc::channel::<Pdata>(10);
+        let status = Arc::new(Mutex::new(self.status));
+
+        // each 
+        let write_task = task::spawn(
+            async move {
+                DownTask::write_to_file(&mut receiver,&mut rr , &status).await;
+            }
+            );
         
+
+        write_task.await?;
         
         Ok(())
     }
@@ -125,7 +136,7 @@ impl DownTask {
         let mut stream = rep.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            result.write_all(&chunk).await?;           
+            result.write_all(&chunk).await?;       
         }
         Ok(())
     }
@@ -216,11 +227,12 @@ impl DownTask {
  pub async fn start(&mut self)->Result<()> {
 
         let (range,len) =self.check_request_range().await ?;
-
+    
         if !self.status.is_init() {
             
             if range && len > (LIMITE_PATE_SIZE *LIMITE_PATE_SIZE)  {
-
+                // new muti download
+               self.muti_download(len).await?;
             } else {
                 self.download_easy().await?;
             }
@@ -237,19 +249,19 @@ impl DownTask {
             }
             if restart {
                 if range {
-                    
+                    // new mutidownload
                 } else {
                     self.download_easy().await?;
                 }
             } else {
-
+               // continue download
             }
 
         }
         Ok(())
     }
 
-
+    
 }
 
 
