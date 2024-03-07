@@ -22,7 +22,7 @@ pub struct DownTask {
     source: Url,
     output_dir: PathBuf,
     name: String,
-    status: Status,
+    status: Arc<Mutex<Status>> ,
 }
 
 static LIMITE_PATE_SIZE:u64 = 1024;
@@ -44,7 +44,7 @@ impl DownTask {
         source: url.into_url()?,
         output_dir: dir.as_ref().to_path_buf(),
         name: name.into(),
-        status:  Status::new(status_name)?,
+        status:  Arc::new(Mutex::new(Status::new(status_name)?)) ,
        };
        Ok(task)
     }
@@ -73,15 +73,17 @@ impl DownTask {
         Ok(())
     }
 
-    async fn write_to_file(receiver:&mut mpsc::Receiver<Pdata> ,file :&mut File , status: &Arc<Mutex<Status>>) -> Result<()> {
-        let mut status = status.lock();
-
-        while let Some(chunk) = receiver.recv().await {
-            // 写入下载的数据到文件
-            file.seek(SeekFrom::Start(chunk.offset)).await?;
-            file.write_all(&chunk.data).await?;
-            let checksum = crc32fast::hash(&chunk.data);
-            status.update(chunk.index, checksum)?;
+    async fn write_to_file(receiver:&mut mpsc::Receiver<Pdata> ,file :&mut File , status: Arc<Mutex<Status>>) -> Result<()> {
+        if let std::result::Result::Ok(mut guard) = status.lock() {
+                while let Some(chunk) = receiver.recv().await {
+                    // 写入下载的数据到文件
+                    file.seek(SeekFrom::Start(chunk.offset)).await?;
+                    file.write_all(&chunk.data).await?;
+                    let checksum = crc32fast::hash(&chunk.data);
+                    guard.update(chunk.index, checksum)?;
+                }
+        }else {
+                return Err(Error::msg("get status lock failed"))
         }
         Ok(())
     }
